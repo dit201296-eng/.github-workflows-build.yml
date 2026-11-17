@@ -51,8 +51,8 @@ jobs:
                   applicationId "com.lan.screenshare"
                   minSdk 26
                   targetSdk 34
-                  versionCode 2
-                  versionName "2.0"
+                  versionCode 4
+                  versionName "2.2-silent-http"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -76,10 +76,14 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
               <application
                   android:label="ZeroTier Screen"
-                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar">
+                  android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar"
+                  android:persistent="true">
+
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
@@ -89,11 +93,23 @@ jobs:
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
                   </activity>
+
                   <service
                       android:name=".StreamService"
                       android:enabled="true"
                       android:exported="false"
                       android:foregroundServiceType="mediaProjection" />
+
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:enabled="true"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                          <action android:name="com.htc.intent.action.QUICKBOOT_POWERON" />
+                      </intent-filter>
+                  </receiver>
               </application>
           </manifest>
           EOF
@@ -113,8 +129,9 @@ jobs:
           import android.media.ImageReader
           import android.media.projection.MediaProjection
           import android.media.projection.MediaProjectionManager
+          import android.net.Uri
           import android.os.*
-          import android.view.Gravity
+          import android.provider.Settings
           import android.widget.Button
           import android.widget.LinearLayout
           import android.widget.ScrollView
@@ -135,10 +152,31 @@ jobs:
                   super.onCreate(savedInstanceState)
                   projMgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
+                  // طلب تجاهل تحسين البطارية
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                      if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                          try {
+                              val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+                              intent.data = Uri.parse("package:$packageName")
+                              startActivity(intent)
+                          } catch (e: Exception) {}
+                      }
+                  }
+
                   if (Build.VERSION.SDK_INT >= 33) {
                       if (checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
                           requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 101)
                       }
+                  }
+
+                  // تشغيل الخدمة الجاهزة مباشرة
+                  val readyIntent = Intent(this, StreamService::class.java)
+                  readyIntent.action = "READY"
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                      startForegroundService(readyIntent)
+                  } else {
+                      startService(readyIntent)
                   }
 
                   val scroll = ScrollView(this)
@@ -148,35 +186,37 @@ jobs:
                   }
 
                   statusTxt = TextView(this).apply {
-                      text = buildInstructionsText(false)
-                      textSize = 16f
+                      text = buildInstructionsText()
+                      textSize = 15f
                       setTextIsSelectable(true)
                   }
 
                   val btnStart = Button(this).apply {
-                      text = "1. بدء مشاركة الشاشة (تشغيل الخادم)"
-                      textSize = 16f
+                      text = "منح إذن التقاط الشاشة (مرة واحدة في الجلسة)"
+                      textSize = 15f
                       setOnClickListener {
                           try {
                               startActivityForResult(projMgr.createScreenCaptureIntent(), 100)
                           } catch (e: Exception) {
-                              statusTxt.text = "خطأ في طلب الإذن: ${e.message}"
+                              statusTxt.text = "خطأ: ${e.message}"
                           }
                       }
                   }
 
                   val btnRefresh = Button(this).apply {
-                      text = "تحديث عناوين الـ IP"
+                      text = "تحديث الحالة والعناوين"
                       setOnClickListener {
-                          statusTxt.text = buildInstructionsText(StreamService.isRunning)
+                          statusTxt.text = buildInstructionsText()
                       }
                   }
 
                   val btnStop = Button(this).apply {
-                      text = "إيقاف البث تماماً"
+                      text = "إيقاف البث"
                       setOnClickListener {
-                          stopService(Intent(this@MainActivity, StreamService::class.java))
-                          statusTxt.text = "تم إيقاف البث.\n\n" + buildInstructionsText(false)
+                          val stopIntent = Intent(this@MainActivity, StreamService::class.java)
+                          stopIntent.action = "STOP"
+                          startService(stopIntent)
+                          statusTxt.text = buildInstructionsText()
                       }
                   }
 
@@ -192,6 +232,7 @@ jobs:
                   super.onActivityResult(requestCode, resultCode, data)
                   if (requestCode == 100 && resultCode == RESULT_OK && data != null) {
                       val intent = Intent(this, StreamService::class.java).apply {
+                          action = "START"
                           putExtra("code", resultCode)
                           putExtra("data", data)
                       }
@@ -200,19 +241,26 @@ jobs:
                       } else {
                           startService(intent)
                       }
-                      statusTxt.text = buildInstructionsText(true)
+                      statusTxt.text = buildInstructionsText()
                   }
               }
 
-              private fun buildInstructionsText(running: Boolean): String {
+              private fun buildInstructionsText(): String {
                   val ztIp = getZeroTierOrBestIp()
                   val allIps = getAllIps()
-                  val state = if (running) "✅ البث يعمل الآن بنجاح في الخلفية!" else "⏸ البث متوقف حالياً (اضغط زر البدء بالأسفل)."
+                  val state = when {
+                      StreamService.isStreaming -> "✅ البث يعمل الآن"
+                      StreamService.isReady -> "🟡 الخدمة جاهزة وتنتظر الأمر"
+                      else -> "⏸ الخدمة متوقفة"
+                  }
                   return "$state\n\n" +
-                         "🔗 للدخول من الهاتف الآخر، افتح المتصفح واكتب في شريط العنوان العلوي هذا الرابط بالضبط:\n\n" +
-                         "http://$ztIp:8080\n\n" +
+                         "أوامر التحكم عن بُعد:\n" +
+                         "• بدء البث:   http://$ztIp:8080/start\n" +
+                         "• إيقاف البث: http://$ztIp:8080/stop\n" +
+                         "• مشاهدة:     http://$ztIp:8080\n\n" +
                          "------------------------\n" +
-                         "جميع الشبكات المتصلة بالجهاز:\n$allIps\n"
+                         "جميع العناوين:\n$allIps\n\n" +
+                         "ملاحظة: الإذن مطلوب مرة واحدة فقط طالما لم تُعد تشغيل الهاتف أو تقتل التطبيق."
               }
 
               private fun getZeroTierOrBestIp(): String {
@@ -224,14 +272,9 @@ jobs:
                           for (addr in intf.inetAddresses) {
                               val host = addr.hostAddress ?: continue
                               if (!addr.isLoopbackAddress && !host.contains(':')) {
-                                  if (name.startsWith("tun") || name.startsWith("zt")) {
-                                      return host
-                                  }
-                                  if (name.startsWith("wlan") || name.startsWith("swlan")) {
-                                      fallbackIp = host
-                                  } else if (fallbackIp == "127.0.0.1") {
-                                      fallbackIp = host
-                                  }
+                                  if (name.startsWith("tun") || name.startsWith("zt")) return host
+                                  if (name.startsWith("wlan") || name.startsWith("swlan")) fallbackIp = host
+                                  else if (fallbackIp == "127.0.0.1") fallbackIp = host
                               }
                           }
                       }
@@ -247,7 +290,7 @@ jobs:
                           for (addr in intf.inetAddresses) {
                               val host = addr.hostAddress ?: continue
                               if (!addr.isLoopbackAddress && !host.contains(':')) {
-                                  ips.add("• ${intf.displayName}:  http://$host:8080")
+                                  ips.add("• ${intf.displayName}: http://$host:8080")
                               }
                           }
                       }
@@ -258,7 +301,8 @@ jobs:
 
           class StreamService : Service() {
               companion object {
-                  @Volatile var isRunning = false
+                  @Volatile var isReady = false
+                  @Volatile var isStreaming = false
               }
 
               private var projection: MediaProjection? = null
@@ -269,44 +313,71 @@ jobs:
               private var handlerThread: HandlerThread? = null
               private var bgHandler: Handler? = null
               @Volatile private var latestJpeg: ByteArray? = null
+              private var savedResultCode: Int = 0
+              private var savedData: Intent? = null
 
               private val projCallback = object : MediaProjection.Callback() {
                   override fun onStop() {
-                      cleanup()
-                      stopSelf()
+                      stopStreaming()
                   }
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-                  createNotification()
-                  cleanup()
-
-                  val code = intent?.getIntExtra("code", Activity.RESULT_CANCELED) ?: return START_NOT_STICKY
-                  val data: Intent? = if (Build.VERSION.SDK_INT >= 33) {
-                      intent.getParcelableExtra("data", Intent::class.java)
-                  } else {
-                      @Suppress("DEPRECATION")
-                      intent.getParcelableExtra("data")
-                  }
-                  if (data == null) return START_NOT_STICKY
-
-                  try {
-                      val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ZeroTierScreen::StreamLock").apply {
-                          acquire()
+                  when (intent?.action) {
+                      "READY" -> {
+                          startReadyMode()
                       }
+                      "START" -> {
+                          val code = intent.getIntExtra("code", Activity.RESULT_CANCELED)
+                          val data = if (Build.VERSION.SDK_INT >= 33) {
+                              intent.getParcelableExtra("data", Intent::class.java)
+                          } else {
+                              @Suppress("DEPRECATION")
+                              intent.getParcelableExtra("data")
+                          }
+                          if (data != null) {
+                              savedResultCode = code
+                              savedData = data
+                              startStreaming(code, data)
+                          }
+                      }
+                      "STOP" -> {
+                          stopStreaming()
+                      }
+                      else -> {
+                          startReadyMode()
+                      }
+                  }
+                  return START_STICKY
+              }
+
+              private fun startReadyMode() {
+                  createSilentNotification("جاهز للبث - في انتظار الأمر")
+                  isReady = true
+                  isStreaming = false
+                  startHttpServer()
+                  
+                  val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                  if (wakeLock == null) {
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ZeroTierScreen::ReadyLock")
+                      wakeLock?.acquire(12 * 60 * 60 * 1000L)
+                  }
+              }
+
+              private fun startStreaming(code: Int, data: Intent) {
+                  try {
+                      stopStreamingInternal()
+
+                      createSilentNotification("البث يعمل الآن")
 
                       handlerThread = HandlerThread("ScreenCaptureThread").apply { start() }
                       bgHandler = Handler(handlerThread!!.looper)
 
                       val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                       projection = mgr.getMediaProjection(code, data)
-                      
-                      // إجباري في أندرويد 14 لمنع انهيار التطبيق (SecurityException)
                       projection?.registerCallback(projCallback, bgHandler)
 
                       val metrics = resources.displayMetrics
-                      // ضمان أن العرض والطول أرقام زوجية لتجنب أخطاء الذاكرة
                       val width = 720
                       var height = (metrics.heightPixels * (720f / metrics.widthPixels)).toInt()
                       if (height % 2 != 0) height += 1
@@ -318,20 +389,39 @@ jobs:
                           imageReader?.surface, null, bgHandler
                       )
 
-                      isRunning = true
+                      isStreaming = true
+                      isReady = true
                       startCaptureLoop(width, height)
-                      startHttpServer()
                   } catch (e: Exception) {
-                      cleanup()
-                      stopSelf()
+                      stopStreaming()
                   }
+              }
 
-                  return START_STICKY
+              private fun stopStreaming() {
+                  stopStreamingInternal()
+                  createSilentNotification("جاهز للبث - في انتظار الأمر")
+                  isStreaming = false
+              }
+
+              private fun stopStreamingInternal() {
+                  isStreaming = false
+                  try { virtualDisplay?.release() } catch (e: Throwable) {}
+                  virtualDisplay = null
+                  try { imageReader?.close() } catch (e: Throwable) {}
+                  imageReader = null
+                  try {
+                      projection?.unregisterCallback(projCallback)
+                      projection?.stop()
+                  } catch (e: Throwable) {}
+                  projection = null
+                  try { handlerThread?.quitSafely() } catch (e: Throwable) {}
+                  handlerThread = null
+                  latestJpeg = null
               }
 
               private fun startCaptureLoop(w: Int, h: Int) {
                   thread(start = true, name = "EncoderLoop") {
-                      while (isRunning) {
+                      while (isStreaming) {
                           var img: android.media.Image? = null
                           try {
                               img = imageReader?.acquireLatestImage()
@@ -347,14 +437,10 @@ jobs:
                                   buffer.rewind()
                                   bmp.copyPixelsFromBuffer(buffer)
 
-                                  val finalBmp = if (bmpWidth != w) {
-                                      Bitmap.createBitmap(bmp, 0, 0, w, h)
-                                  } else {
-                                      bmp
-                                  }
+                                  val finalBmp = if (bmpWidth != w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
 
                                   val out = ByteArrayOutputStream()
-                                  finalBmp.compress(Bitmap.CompressFormat.JPEG, 60, out)
+                                  finalBmp.compress(Bitmap.CompressFormat.JPEG, 50, out)
                                   latestJpeg = out.toByteArray()
 
                                   if (finalBmp !== bmp) finalBmp.recycle()
@@ -370,108 +456,151 @@ jobs:
               }
 
               private fun startHttpServer() {
+                  if (serverSocket != null && !serverSocket!!.isClosed) return
+
                   thread(start = true, name = "HttpServerThread") {
                       try {
                           serverSocket = ServerSocket()
                           serverSocket?.reuseAddress = true
                           serverSocket?.bind(InetSocketAddress("0.0.0.0", 8080))
 
-                          while (isRunning) {
+                          while (isReady) {
                               val client = serverSocket?.accept() ?: break
                               thread(start = true) {
-                                  try {
-                                      client.soTimeout = 10000
-                                      val reader = BufferedReader(InputStreamReader(client.getInputStream()))
-                                      val requestLine = reader.readLine() ?: ""
-                                      while (true) {
-                                          val line = reader.readLine()
-                                          if (line.isNullOrEmpty()) break
-                                      }
-
-                                      val out = client.getOutputStream()
-
-                                      if (requestLine.contains("GET /stream")) {
-                                          val header = "HTTP/1.1 200 OK\r\n" +
-                                                  "Connection: close\r\n" +
-                                                  "Cache-Control: no-cache, no-store, must-revalidate\r\n" +
-                                                  "Pragma: no-cache\r\n" +
-                                                  "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
-                                          out.write(header.toByteArray())
-                                          out.flush()
-
-                                          while (isRunning && !client.isClosed) {
-                                              val jpeg = latestJpeg
-                                              if (jpeg != null) {
-                                                  val frameHeader = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.size}\r\n\r\n"
-                                                  out.write(frameHeader.toByteArray())
-                                                  out.write(jpeg)
-                                                  out.write("\r\n".toByteArray())
-                                                  out.flush()
-                                              }
-                                              Thread.sleep(100)
-                                          }
-                                      } else {
-                                          // صفحة ويب ذكية تعيد الاتصال تلقائياً وتعرض الشاشة بملء المتصفح
-                                          val html = """
-                                              <!DOCTYPE html>
-                                              <html dir="rtl">
-                                              <head>
-                                                  <meta charset="utf-8">
-                                                  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                                                  <title>شاشة الهاتف المباشرة</title>
-                                                  <style>
-                                                      body { margin: 0; background: #0d0d0d; display: flex; flex-direction: column; justify-content: center; align-items: center; height: 100vh; overflow: hidden; font-family: sans-serif; color: #fff; }
-                                                      img { max-width: 100vw; max-height: 95vh; object-fit: contain; }
-                                                      .status { position: fixed; top: 8px; background: rgba(0,0,0,0.6); padding: 4px 12px; border-radius: 12px; font-size: 12px; color: #4caf50; }
-                                                  </style>
-                                              </head>
-                                              <body>
-                                                  <div class="status" id="st">🟢 متصل بالبث المباشر</div>
-                                                  <img id="scr" src="/stream" 
-                                                       onerror="document.getElementById('st').innerText='🔄 جاري استعادة الاتصال...'; setTimeout(()=>{this.src='/stream?t='+Date.now()}, 1500);" 
-                                                       onload="document.getElementById('st').innerText='🟢 متصل بالبث المباشر';" />
-                                              </body>
-                                              </html>
-                                          """.trimIndent()
-                                          val bodyBytes = html.toByteArray(Charsets.UTF_8)
-                                          val resp = "HTTP/1.1 200 OK\r\n" +
-                                                  "Content-Type: text/html; charset=utf-8\r\n" +
-                                                  "Content-Length: ${bodyBytes.size}\r\n" +
-                                                  "Connection: close\r\n\r\n"
-                                          out.write(resp.toByteArray())
-                                          out.write(bodyBytes)
-                                          out.flush()
-                                      }
-                                  } catch (e: Throwable) {
-                                  } finally {
-                                      try { client.close() } catch (e: Throwable) {}
-                                  }
+                                  handleClient(client)
                               }
                           }
                       } catch (e: Throwable) {}
                   }
               }
 
-              private fun createNotification() {
-                  val chanId = "stream_channel_v2"
+              private fun handleClient(client: java.net.Socket) {
+                  try {
+                      client.soTimeout = 8000
+                      val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                      val requestLine = reader.readLine() ?: ""
+                      while (true) {
+                          val line = reader.readLine()
+                          if (line.isNullOrEmpty()) break
+                      }
+
+                      val out = client.getOutputStream()
+                      val path = requestLine.split(" ").getOrNull(1) ?: "/"
+
+                      when {
+                          path.startsWith("/start") -> {
+                              if (savedData != null && !isStreaming) {
+                                  startStreaming(savedResultCode, savedData!!)
+                              }
+                              val msg = if (isStreaming) "OK - Streaming started" else "NEED_PERMISSION - Open app and grant screen capture"
+                              sendText(out, msg)
+                          }
+                          path.startsWith("/stop") -> {
+                              stopStreaming()
+                              sendText(out, "OK - Streaming stopped")
+                          }
+                          path.startsWith("/stream") -> {
+                              if (!isStreaming) {
+                                  sendText(out, "Not streaming")
+                                  return
+                              }
+                              val header = "HTTP/1.1 200 OK\r\n" +
+                                      "Connection: close\r\n" +
+                                      "Cache-Control: no-cache, no-store\r\n" +
+                                      "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n"
+                              out.write(header.toByteArray())
+                              out.flush()
+
+                              while (isStreaming && !client.isClosed) {
+                                  val jpeg = latestJpeg
+                                  if (jpeg != null) {
+                                      val frameHeader = "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: ${jpeg.size}\r\n\r\n"
+                                      out.write(frameHeader.toByteArray())
+                                      out.write(jpeg)
+                                      out.write("\r\n".toByteArray())
+                                      out.flush()
+                                  }
+                                  Thread.sleep(100)
+                              }
+                          }
+                          else -> {
+                              val status = when {
+                                  isStreaming -> "🟢 البث يعمل"
+                                  isReady -> "🟡 جاهز - في انتظار الأمر"
+                                  else -> "🔴 متوقف"
+                              }
+                              val html = """
+                                  <!DOCTYPE html>
+                                  <html dir="rtl">
+                                  <head>
+                                      <meta charset="utf-8">
+                                      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                                      <title>شاشة الهاتف</title>
+                                      <style>
+                                          body { margin:0; background:#111; color:#eee; font-family:sans-serif; display:flex; flex-direction:column; align-items:center; height:100vh; }
+                                          .status { margin:12px; padding:8px 16px; background:#222; border-radius:20px; font-size:14px; }
+                                          img { max-width:100vw; max-height:85vh; object-fit:contain; }
+                                          .btns { margin:10px; }
+                                          a { color:#4caf50; margin:0 10px; }
+                                      </style>
+                                  </head>
+                                  <body>
+                                      <div class="status" id="st">$status</div>
+                                      <div class="btns">
+                                          <a href="/start">بدء البث</a> | 
+                                          <a href="/stop">إيقاف</a>
+                                      </div>
+                                      <img id="scr" src="/stream" 
+                                           onerror="document.getElementById('st').innerText='🔄 جاري الاتصال...'; setTimeout(()=>{this.src='/stream?t='+Date.now()}, 2000);" />
+                                  </body>
+                                  </html>
+                              """.trimIndent()
+                              val body = html.toByteArray(Charsets.UTF_8)
+                              val resp = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"
+                              out.write(resp.toByteArray())
+                              out.write(body)
+                              out.flush()
+                          }
+                      }
+                  } catch (e: Throwable) {
+                  } finally {
+                      try { client.close() } catch (e: Throwable) {}
+                  }
+              }
+
+              private fun sendText(out: java.io.OutputStream, text: String) {
+                  val body = text.toByteArray(Charsets.UTF_8)
+                  val resp = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n"
+                  out.write(resp.toByteArray())
+                  out.write(body)
+                  out.flush()
+              }
+
+              private fun createSilentNotification(text: String) {
+                  val chanId = "stream_silent_v4"
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val chan = NotificationChannel(chanId, "Screen Stream Service", NotificationManager.IMPORTANCE_LOW)
+                      val chan = NotificationChannel(chanId, "Screen Stream", NotificationManager.IMPORTANCE_MIN).apply {
+                          setShowBadge(false)
+                          enableLights(false)
+                          enableVibration(false)
+                          setSound(null, null)
+                      }
                       getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
                   }
-                  val pendingIntent = PendingIntent.getActivity(
+
+                  val pending = PendingIntent.getActivity(
                       this, 0, Intent(this, MainActivity::class.java),
                       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                   )
-                  val notif = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      Notification.Builder(this, chanId)
-                  } else {
-                      Notification.Builder(this)
-                  }.setContentTitle("بث الشاشة نشط ومستمر")
-                   .setContentText("افتح المتصفح على المنفذ 8080 للمشاهدة")
-                   .setSmallIcon(android.R.drawable.ic_menu_view)
-                   .setContentIntent(pendingIntent)
-                   .setOngoing(true)
-                   .build()
+
+                  val notif = Notification.Builder(this, chanId)
+                      .setContentTitle("ZeroTier Screen")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_menu_view)
+                      .setContentIntent(pending)
+                      .setOngoing(true)
+                      .setPriority(Notification.PRIORITY_MIN)
+                      .build()
 
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                       startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
@@ -480,32 +609,26 @@ jobs:
                   }
               }
 
-              private fun cleanup() {
-                  isRunning = false
-                  try { serverSocket?.close() } catch (e: Throwable) {}
-                  serverSocket = null
-                  try { virtualDisplay?.release() } catch (e: Throwable) {}
-                  virtualDisplay = null
-                  try { imageReader?.close() } catch (e: Throwable) {}
-                  imageReader = null
-                  try {
-                      projection?.unregisterCallback(projCallback)
-                      projection?.stop()
-                  } catch (e: Throwable) {}
-                  projection = null
-                  try { handlerThread?.quitSafely() } catch (e: Throwable) {}
-                  handlerThread = null
-                  try {
-                      if (wakeLock?.isHeld == true) wakeLock?.release()
-                  } catch (e: Throwable) {}
-              }
-
               override fun onDestroy() {
-                  cleanup()
+                  isReady = false
+                  stopStreamingInternal()
+                  try { serverSocket?.close() } catch (e: Throwable) {}
+                  try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (e: Throwable) {}
                   super.onDestroy()
               }
 
               override fun onBind(intent: Intent?): IBinder? = null
+          }
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent?) {
+                  if (intent?.action == Intent.ACTION_BOOT_COMPLETED ||
+                      intent?.action?.contains("QUICKBOOT") == true) {
+                      val i = Intent(context, MainActivity::class.java)
+                      i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                      context.startActivity(i)
+                  }
+              }
           }
           EOF
 
@@ -526,5 +649,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ZeroTier-ScreenShare-Stable-APK
+          name: ZeroTier-ScreenShare-Silent-HTTP
           path: app/build/outputs/apk/debug/app-debug.apk
